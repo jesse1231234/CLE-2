@@ -41,6 +41,25 @@ LLM_SAMPLE_CHARS = 5000
 MAX_REASONABLE_WORDS_PER_DOC = 200_000
 MAX_REASONABLE_MINUTES_PER_DOC = 1_000
 
+# ============================================================
+# DO-time constants
+# ============================================================
+
+# Global clamps for DO-time estimates (minutes)
+DISCUSSION_MIN_MIN = 10.0
+DISCUSSION_MAX_MIN = 180.0
+ASSIGNMENT_MIN_MIN = 15.0
+ASSIGNMENT_MAX_MIN = 360.0
+
+# Complexity multipliers (LLM returns one of these enums)
+TASK_COMPLEXITY_MULT = {
+    "simple": 0.75,
+    "standard": 1.0,
+    "complex": 1.5,
+    "very_complex": 2.0,
+}
+
+
 # Heuristics for non-text
 MIN_PER_PDF_PAGE = 3.5
 MIN_PER_PPT_SLIDE = 2.0
@@ -64,16 +83,6 @@ AZ_API_KEY = get_secret("AZURE_OPENAI_API_KEY", "") or ""
 AZ_MODEL = get_secret("AZURE_OPENAI_MODEL", "") or ""
 AZ_API_VERSION = get_secret("AZURE_OPENAI_API_VERSION", "2024-02-15-preview") or "2024-02-15-preview"
 
-# ============================================================
-# DO-time complexity multipliers
-# ============================================================
-
-TASK_COMPLEXITY_MULT = {
-    "simple": 0.75,
-    "standard": 1.0,
-    "complex": 1.5,
-    "very_complex": 2.0,
-}
 
 # ============================================================
 # Utility: formatting
@@ -259,30 +268,6 @@ def get_quiz(course_id: int, quiz_id: int) -> dict:
     r = requests.get(url, headers=canvas_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
-
-
-# ---------------- New Quizzes (default) ----------------
-
-
-def get_new_quiz(course_id: int, assignment_id: int) -> dict:
-    """Fetch a single New Quiz.
-
-    Canvas New Quizzes API uses the *assignment_id* as the quiz identifier.
-    Endpoint: GET /api/quiz/v1/courses/:course_id/quizzes/:assignment_id
-    """
-    url = f"{CANVAS_BASE}/api/quiz/v1/courses/{course_id}/quizzes/{assignment_id}"
-    r = requests.get(url, headers=canvas_headers(), timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def list_new_quiz_items(course_id: int, assignment_id: int) -> List[dict]:
-    """List items in a New Quiz.
-
-    Endpoint: GET /api/quiz/v1/courses/:course_id/quizzes/:assignment_id/items
-    """
-    url = f"{CANVAS_BASE}/api/quiz/v1/courses/{course_id}/quizzes/{assignment_id}/items"
-    return canvas_get(url, params={"per_page": 100})
 
 
 def get_course_file(course_id: int, file_id: int) -> dict:
@@ -504,41 +489,25 @@ def reading_minutes_from_words(words: int, base_wpm: int, wpm_factor: float) -> 
 
 
 # ============================================================
-# DO-time estimation (bounded + explainable)
+# DO-time estimation (unchanged conceptually)
 # ============================================================
 
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    try:
-        v = float(v)
-    except Exception:
-        v = 0.0
-    return max(lo, min(hi, v))
-
-
-def default_task_complexity() -> Dict[str, str]:
-    return {"task_complexity": "standard", "notes": "default (LLM off/failed)"}
-
-
-def azure_llm_task_complexity(text: str, item_type: str, level: str) -> Dict[str, str]:
-    """Classify task complexity (NOT minutes).
-
-    Returns {task_complexity: one of simple|standard|complex|very_complex, notes: str}
+def azure_llm_task_time(text: str, item_type: str, level: str) -> float:
+    """
+    Still uses item instructions text (not huge). You can keep as-is or sample it too.
     """
     if not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL) or AzureOpenAI is None:
-        return default_task_complexity()
+        return 0.0
 
     client = azure_llm_client()
     sys_msg = (
-        "You are classifying the complexity of a single Canvas course task. "
-        "Return ONLY JSON with keys: task_complexity, notes. "
-        "task_complexity must be one of: simple, standard, complex, very_complex. "
-        "Do NOT estimate minutes."
+        "Return ONLY JSON with keys: do_minutes (float), rationale (string). "
+        "do_minutes excludes reading time."
     )
     user_msg = (
         f"Item type: {item_type}\nStudent level: {level}\n\n"
-        "Classify complexity of completing the task (excluding reading/watching).\n\n"
-        f"{(text or '')[:8000]}"
+        "Estimate completion time excluding reading time.\n\n"
+        f"{text[:15000]}"
     )
 
     try:
@@ -549,120 +518,34 @@ def azure_llm_task_complexity(text: str, item_type: str, level: str) -> Dict[str
             response_format={"type": "json_object"},
         )
         data = json.loads(cc.choices[0].message.content)
-        tc = (data.get("task_complexity") or "standard").strip().lower()
-        if tc not in TASK_COMPLEXITY_MULT:
-            tc = "standard"
-        return {"task_complexity": tc, "notes": (data.get("notes") or "").strip()}
+        return float(data.get("do_minutes", 0.0))
     except Exception:
-        return default_task_complexity()
+        return 0.0
 
 
-def complexity_multiplier(task_complexity: str) -> float:
-    tc = (task_complexity or "standard").strip().lower()
-    return float(TASK_COMPLEXITY_MULT.get(tc, 1.0))
-
-
-def assignment_base_minutes(prompt_words: int, level: str) -> float:
-    """Explainable baseline based on instruction length bands."""
+def heuristic_task_time(words: int, item_type: str, level: str) -> float:
     lvl_factor = 1.0 if level.lower().startswith("under") else 1.25
-    if prompt_words < 150:
-        base = 30.0
-    elif prompt_words < 600:
-        base = 60.0
-    else:
-        base = 120.0
-    return base * lvl_factor
+    it = item_type.lower()
+    if it == "assignment":
+        base = 30.0 if words < 150 else (60.0 if words < 600 else 120.0)
+        return base * lvl_factor
+    if it == "discussion":
+        return 35.0 * lvl_factor
+    return 0.0
 
 
-def discussion_component_minutes(prompt_words: int, level: str) -> Dict[str, float]:
-    """Component model for discussions based on prompt length."""
-    lvl_factor = 1.0 if level.lower().startswith("under") else 1.25
-
-    if prompt_words < 150:
-        initial = 18.0
-        read_peers = 10.0
-        replies = 7.0
-    elif prompt_words < 400:
-        initial = 25.0
-        read_peers = 12.0
-        replies = 10.0
-    else:
-        initial = 35.0
-        read_peers = 15.0
-        replies = 12.0
-
-    return {
-        "initial_post": initial * lvl_factor,
-        "read_peers": read_peers * lvl_factor,
-        "replies": replies * lvl_factor,
-    }
-
-
-def new_quiz_time_limit_minutes(new_quiz: dict) -> Optional[float]:
-    """If New Quiz has an explicit time limit, return it in minutes."""
-    qs = (new_quiz or {}).get("quiz_settings") or {}
-    if qs.get("has_time_limit") is True:
-        secs = qs.get("session_time_limit_in_seconds")
-        try:
-            secs = int(secs)
-        except Exception:
-            secs = None
-        if secs and secs > 0:
-            return float(secs) / 60.0
-    return None
-
-
-def classic_quiz_time_limit_minutes(classic_quiz: dict) -> Optional[float]:
-    t = (classic_quiz or {}).get("time_limit")
-    try:
-        t = float(t)
-    except Exception:
-        t = None
-    return t if (t and t > 0) else None
-
-
-def estimate_new_quiz_minutes_from_items(items: List[dict], fallback_question_count: Optional[int] = None) -> float:
-    """Sum per-question seconds using New Quiz Items interaction_type_slug."""
-    total_seconds = 0
-    counted = 0
-
-    # New Quizzes interaction_type_slug values are documented in New Quiz Items API
-    # (e.g., 'choice', 'true-false', 'matching', 'essay', 'numeric', etc.).
-    seconds_by_slug = {
-        "choice": 75,
-        "true-false": 60,
-        "multi-answer": 90,
-        "matching": 105,
-        "categorization": 120,
-        "ordering": 120,
-        "rich-fill-blank": 150,
-        "numeric": 150,
-        "formula": 180,
-        "file-upload": 300,
-        "hot-spot": 150,
-        "essay": 900,
-    }
-
-    for it in items or []:
-        entry = (it or {}).get("entry") or {}
-        slug = (entry.get("interaction_type_slug") or "").strip().lower()
-        if not slug:
-            continue
-        counted += 1
-        total_seconds += int(seconds_by_slug.get(slug, QUIZ_SECONDS_DEFAULT))
-
-    if counted > 0:
-        return max(5.0, total_seconds / 60.0)
-
-    # Fallback if items can't be read (permissions / quiz type / etc.)
-    qcount = fallback_question_count or 0
+def estimate_quiz_time(meta: dict) -> float:
+    if not meta:
+        return 10.0
+    t = meta.get("time_limit")
+    if t:
+        return float(t)
+    qcount = meta.get("question_count") or 5
     try:
         qcount = int(qcount)
     except Exception:
-        qcount = 0
-    if qcount > 0:
-        return max(5.0, (qcount * QUIZ_SECONDS_DEFAULT) / 60.0)
-    return 10.0
+        qcount = 5
+    return max(5.0, qcount * 2.0)
 
 
 # ============================================================
@@ -685,7 +568,6 @@ def main():
     base_wpm = st.sidebar.slider("Base Reading Speed (words per minute)", 150, 350, 200, 10)
     use_llm = st.sidebar.checkbox("Use Azure OpenAI for difficulty & DO time", value=True)
     debug_breakdown = st.sidebar.checkbox("Debug read-time breakdown", value=False)
-    debug_do_breakdown = st.sidebar.checkbox("Debug DO-time breakdown", value=False)
 
     # Status
     st.sidebar.markdown("### Canvas status")
@@ -762,7 +644,6 @@ This estimator calculates:
 
             results = []
             debug_rows: List[dict] = []
-            debug_do_rows: List[dict] = []
 
             for it in items:
                 item_type = it.get("item_type", "")
@@ -773,8 +654,6 @@ This estimator calculates:
                 read_min = 0.0
                 watch_min = 0.0
                 do_min = 0.0
-                task_complexity = "standard"
-                do_notes = ""
 
                 # -------- Pages / Assignments / Discussions --------
                 if item_type in ("Page", "Assignment", "Discussion"):
@@ -956,42 +835,13 @@ This estimator calculates:
 
                     # DO time for assignments/discussions
                     if item_type in ("Assignment", "Discussion"):
-                        comp = azure_llm_task_complexity(page_text, item_type, level) if use_llm else default_task_complexity()
-                        task_complexity = comp.get("task_complexity", "standard")
-                        do_notes = comp.get("notes", "")
-                        mult = complexity_multiplier(task_complexity)
-
-                        if item_type == "Assignment":
-                            base_do = assignment_base_minutes(page_words, level)
-                            do_min = clamp(base_do * mult, ASSIGNMENT_MIN_MIN, ASSIGNMENT_MAX_MIN)
-                            if debug_do_breakdown:
-                                debug_do_rows.append({
-                                    "item": title,
-                                    "type": item_type,
-                                    "prompt_words": page_words,
-                                    "task_complexity": task_complexity,
-                                    "multiplier": mult,
-                                    "base_do_min": round(base_do, 2),
-                                    "do_min": round(do_min, 2),
-                                    "notes": do_notes,
-                                })
+                        if use_llm:
+                            do_min = azure_llm_task_time(page_text, item_type, level)
+                            # if LLM fails returns 0; fall back
+                            if do_min <= 0 and page_words > 0:
+                                do_min = heuristic_task_time(page_words, item_type, level)
                         else:
-                            comps = discussion_component_minutes(page_words, level)
-                            base_do = float(sum(comps.values()))
-                            do_min = clamp(base_do * mult, DISCUSSION_MIN_MIN, DISCUSSION_MAX_MIN)
-                            if debug_do_breakdown:
-                                row = {
-                                    "item": title,
-                                    "type": item_type,
-                                    "prompt_words": page_words,
-                                    "task_complexity": task_complexity,
-                                    "multiplier": mult,
-                                    "base_do_min": round(base_do, 2),
-                                    "do_min": round(do_min, 2),
-                                    "notes": do_notes,
-                                }
-                                row.update({k: round(v, 2) for k, v in comps.items()})
-                                debug_do_rows.append(row)
+                            do_min = heuristic_task_time(page_words, item_type, level)
 
                 # -------- File module items (Canvas file items) --------
                 elif item_type == "File":
@@ -1030,98 +880,18 @@ This estimator calculates:
                 elif item_type == "Quiz":
                     q_meta = it.get("content_details") or {}
                     quiz_id = it.get("content_id")
+                    do_min = estimate_quiz_time(q_meta)
 
-                    # Default to New Quizzes endpoints first; fall back to Classic.
-                    new_quiz = None
-                    classic_quiz = None
-
-                    # Complexity classification context (used unless explicit time limit exists)
-                    if use_llm:
-                        # We'll classify off whatever instructions we can fetch below.
-                        pass
-
-                    # Try New Quizzes API (quiz id is assignment_id)
-                    try:
-                        if quiz_id:
-                            new_quiz = get_new_quiz(int(course_id), int(quiz_id))
-                    except Exception:
-                        new_quiz = None
-
-                    if new_quiz is not None:
-                        # If time limit explicitly set, ALWAYS default to it
-                        tl = new_quiz_time_limit_minutes(new_quiz)
-                        instructions = strip_html_to_text(new_quiz.get("instructions", "") or "")
-                        comp = azure_llm_task_complexity(instructions, "Quiz", level) if use_llm else default_task_complexity()
-                        task_complexity = comp.get("task_complexity", "standard")
-                        do_notes = comp.get("notes", "")
-                        mult = complexity_multiplier(task_complexity)
-
-                        if tl is not None:
-                            do_min = float(tl)
-                            do_notes = (do_notes + " | used explicit time limit").strip(" |")
-                        else:
-                            try:
-                                items = list_new_quiz_items(int(course_id), int(quiz_id))
-                            except Exception:
-                                items = []
-                            base_do = estimate_new_quiz_minutes_from_items(
-                                items,
-                                fallback_question_count=q_meta.get("question_count"),
-                            )
-                            do_min = max(5.0, base_do * mult)
-
-                        if debug_do_breakdown:
-                            debug_do_rows.append({
-                                "item": title,
-                                "type": item_type,
-                                "prompt_words": words_from_text(instructions),
-                                "task_complexity": task_complexity,
-                                "multiplier": mult,
-                                "base_do_min": round(float(tl if tl is not None else base_do), 2),
-                                "do_min": round(do_min, 2),
-                                "notes": do_notes,
-                                "quiz_api": "new_quizzes",
-                            })
-
-                    else:
-                        # Classic fallback
+                    if use_llm and quiz_id:
                         try:
-                            if quiz_id:
-                                classic_quiz = get_quiz(int(course_id), int(quiz_id))
+                            quiz = get_quiz(int(course_id), quiz_id)
+                            q_text = strip_html_to_text(quiz.get("description", "") or "")
+                            # Could sample too, but description is usually small
+                            do_llm = azure_llm_task_time(q_text, "Quiz", level)
+                            if do_llm > 0:
+                                do_min = do_llm
                         except Exception:
-                            classic_quiz = None
-
-                        desc = strip_html_to_text((classic_quiz or {}).get("description", "") or "")
-                        comp = azure_llm_task_complexity(desc, "Quiz", level) if use_llm else default_task_complexity()
-                        task_complexity = comp.get("task_complexity", "standard")
-                        do_notes = comp.get("notes", "")
-                        mult = complexity_multiplier(task_complexity)
-
-                        tl = classic_quiz_time_limit_minutes(classic_quiz or {})
-                        if tl is not None:
-                            do_min = float(tl)
-                            do_notes = (do_notes + " | used explicit time limit").strip(" |")
-                        else:
-                            qcount = (classic_quiz or {}).get("question_count") or q_meta.get("question_count") or 0
-                            try:
-                                qcount = int(qcount)
-                            except Exception:
-                                qcount = 0
-                            base_do = max(5.0, (qcount * QUIZ_SECONDS_DEFAULT) / 60.0) if qcount > 0 else 10.0
-                            do_min = max(5.0, base_do * mult)
-
-                        if debug_do_breakdown:
-                            debug_do_rows.append({
-                                "item": title,
-                                "type": item_type,
-                                "prompt_words": words_from_text(desc),
-                                "task_complexity": task_complexity,
-                                "multiplier": mult,
-                                "base_do_min": round(float(tl if tl is not None else base_do), 2),
-                                "do_min": round(do_min, 2),
-                                "notes": do_notes,
-                                "quiz_api": "classic_fallback",
-                            })
+                            pass
 
                 # -------- External link video item --------
                 else:
@@ -1152,8 +922,6 @@ This estimator calculates:
                         "read_min": round(read_min, 2),
                         "watch_min": round(watch_min, 2),
                         "do_min": round(do_min, 2),
-                        "task_complexity": task_complexity,
-                        "do_notes": do_notes,
                         "total_min": round(total_min, 2),
                     }
                 )
@@ -1166,11 +934,6 @@ This estimator calculates:
                 with st.expander("Debug: read-time breakdown (Canvas page text + Canvas-hosted docs)", expanded=False):
                     dbg = pd.DataFrame(debug_rows)
                     st.dataframe(dbg, use_container_width=True)
-
-            if debug_do_breakdown and debug_do_rows:
-                with st.expander("Debug: DO-time breakdown (complexity + heuristics)", expanded=False):
-                    dbg_do = pd.DataFrame(debug_do_rows)
-                    st.dataframe(dbg_do, use_container_width=True)
 
     # 3) Video durations
     st.header("3) Enter video durations (hh:mm:ss)")
