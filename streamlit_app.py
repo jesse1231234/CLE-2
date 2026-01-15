@@ -64,6 +64,16 @@ AZ_API_KEY = get_secret("AZURE_OPENAI_API_KEY", "") or ""
 AZ_MODEL = get_secret("AZURE_OPENAI_MODEL", "") or ""
 AZ_API_VERSION = get_secret("AZURE_OPENAI_API_VERSION", "2024-02-15-preview") or "2024-02-15-preview"
 
+# ============================================================
+# DO-time complexity multipliers
+# ============================================================
+
+TASK_COMPLEXITY_MULT = {
+    "simple": 0.75,
+    "standard": 1.0,
+    "complex": 1.5,
+    "very_complex": 2.0,
+}
 
 # ============================================================
 # Utility: formatting
