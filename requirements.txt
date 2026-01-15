@@ -1,0 +1,7 @@
+streamlit
+requests
+beautifulsoup4
+pdfminer.six
+python-docx
+python-pptx
+openai>=1.52.0
